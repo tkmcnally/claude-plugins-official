@@ -102,7 +102,7 @@ jobs:
           git commit -m "Bump SHA pins for ${{ steps.discover.outputs.count }} plugin(s)
 
           Plugins: ${{ steps.discover.outputs.bumped_names }}"
-          git push -u origin "$branch"
+          git push -u origin "$branch" --force-with-lease
 
       # GITHUB_TOKEN cannot create PRs (org policy: "Allow GitHub Actions to
       # create and approve pull requests" is disabled). Use the same GitHub App

@@ -88,27 +88,46 @@ jobs:
           bun .github/scripts/validate-marketplace.ts .claude-plugin/marketplace.json
           bun .github/scripts/check-marketplace-sorted.ts
 
-      - name: Create pull request
+      - name: Push bump branch
         if: steps.existing.outputs.count == '0' && steps.discover.outputs.count != '0' && inputs.dry_run != true
-        env:
-          GH_TOKEN: ${{ github.token }}
+        id: push
         run: |
           branch="auto/bump-shas-$(date +%Y%m%d)"
-          count="${{ steps.discover.outputs.count }}"
-          names="${{ steps.discover.outputs.bumped_names }}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
           git add .claude-plugin/marketplace.json
-          git commit -m "Bump SHA pins for $count plugin(s)
+          git commit -m "Bump SHA pins for ${{ steps.discover.outputs.count }} plugin(s)
 
-          Plugins: $names"
+          Plugins: ${{ steps.discover.outputs.bumped_names }}"
           git push -u origin "$branch"
 
+      # GITHUB_TOKEN cannot create PRs (org policy: "Allow GitHub Actions to
+      # create and approve pull requests" is disabled). Use the same GitHub App
+      # that -internal's bump workflow uses.
+      #
+      # Prerequisite: app 2812036 must be installed on this repo. The PEM
+      # secret must exist in this repo's settings (shared with -internal).
+      - name: Generate bot token
+        if: steps.push.outcome == 'success'
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: 2812036
+          private-key: ${{ secrets.CLAUDE_DIRECTORY_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Create pull request
+        if: steps.push.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
           gh pr create \
             --base main \
-            --head "$branch" \
-            --title "Bump SHA pins ($count plugins)" \
+            --head "${{ steps.push.outputs.branch }}" \
+            --title "Bump SHA pins (${{ steps.discover.outputs.count }} plugins)" \
             --body-file /tmp/bump-pr-body.md \
             --label sha-bump

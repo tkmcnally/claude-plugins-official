@@ -113,13 +113,15 @@ type Row = {
   handle_id: string | null
   chat_guid: string
   chat_style: number | null
+  account: string | null
 }
 
 const qWatermark = db.query<{ max: number | null }, []>('SELECT MAX(ROWID) AS max FROM message')
 
 const qPoll = db.query<Row, [number]>(`
   SELECT m.ROWID AS rowid, m.guid, m.text, m.attributedBody, m.date, m.is_from_me,
-         m.cache_has_attachments, m.service, h.id AS handle_id, c.guid AS chat_guid, c.style AS chat_style
+         m.cache_has_attachments, m.service, h.id AS handle_id, c.guid AS chat_guid, c.style AS chat_style,
+         m.account AS account
   FROM message m
   JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
   JOIN chat c ON c.ROWID = cmj.chat_id
@@ -130,7 +132,8 @@ const qPoll = db.query<Row, [number]>(`
 
 const qHistory = db.query<Row, [string, number]>(`
   SELECT m.ROWID AS rowid, m.guid, m.text, m.attributedBody, m.date, m.is_from_me,
-         m.cache_has_attachments, m.service, h.id AS handle_id, c.guid AS chat_guid, c.style AS chat_style
+         m.cache_has_attachments, m.service, h.id AS handle_id, c.guid AS chat_guid, c.style AS chat_style,
+         m.account AS account
   FROM message m
   JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
   JOIN chat c ON c.ROWID = cmj.chat_id
@@ -207,6 +210,14 @@ type Access = {
   mentionPatterns?: string[]
   textChunkLimit?: number
   chunkMode?: 'length' | 'newline'
+  // When set, inbound messages must have message.account in this set. Lets
+  // you run a dedicated Apple ID handle as the Claude inbox while normal
+  // traffic on other handles stays invisible. Compared lowercased, without
+  // the "E:" / "p:" chat.db prefix.
+  ownerInboxes?: string[]
+  // When set, only messages in these chat GUIDs flow to Claude. An explicit
+  // whitelist — empty array means block everything.
+  enabledChats?: string[]
 }
 
 // Default is allowlist, not pairing. Unlike Discord/Telegram where a bot has
@@ -250,6 +261,8 @@ function readAccessFile(): Access {
       mentionPatterns: parsed.mentionPatterns,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
+      ownerInboxes: parsed.ownerInboxes,
+      enabledChats: parsed.enabledChats,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -289,8 +302,12 @@ function saveAccess(a: Access): void {
 
 // chat.db has every text macOS received, gated or not. chat_messages scopes
 // reads to chats you've opened: self-chat, allowlisted DMs, configured groups.
+// If access.enabledChats is set it overrides the derived scope — only those
+// explicit GUIDs are in scope, so a chat can be enrolled or paused without
+// touching the sender allowlist.
 function allowedChatGuids(): Set<string> {
   const access = loadAccess()
+  if (access.enabledChats) return new Set(access.enabledChats)
   const out = new Set<string>(Object.keys(access.groups))
   const handles = new Set([...access.allowFrom.map(h => h.toLowerCase()), ...SELF])
   for (const h of handles) {
@@ -774,9 +791,30 @@ function expandTilde(p: string): string {
   return p.startsWith('~/') ? join(homedir(), p.slice(2)) : p
 }
 
+// Strip the "E:" / "p:" prefix chat.db uses on message.account so user config
+// is plain addresses ("tk.mcnally@icloud.com" / "+15551234567").
+function normAccount(s: string | null): string | null {
+  if (!s) return null
+  return (/^[A-Za-z]:/.test(s) ? s.slice(2) : s).toLowerCase()
+}
+
 function handleInbound(r: Row): void {
   if (!r.chat_guid) return
   if (!ALLOW_SMS && r.service !== 'iMessage') return
+
+  // Per-inbox filter: the plugin sees every message in chat.db regardless of
+  // which of the owner's Apple ID handles it was delivered to. ownerInboxes
+  // lets you restrict to one dedicated handle (e.g. a Claude-only iCloud
+  // email) so normal traffic on your other handles stays invisible.
+  const access = loadAccess()
+  if (access.ownerInboxes && access.ownerInboxes.length > 0) {
+    const acct = normAccount(r.account)
+    const allowed = access.ownerInboxes.map(h => h.toLowerCase())
+    if (!acct || !allowed.includes(acct)) return
+  }
+  // Per-chat whitelist: if enabledChats is set, only those GUIDs flow.
+  // Complements ownerInboxes — you can combine both for defense in depth.
+  if (access.enabledChats && !access.enabledChats.includes(r.chat_guid)) return
 
   // style 45 = DM, 43 = group. Drop unknowns rather than risk routing a
   // group message through the DM gate and leaking a pairing code.
